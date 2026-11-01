@@ -1,0 +1,23 @@
+# Environment & Secrets
+.env
+.env.*
+*.key
+credentials.json
+
+# Python virtual environments & packages
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+
+# uv cache & packaging artifacts
+.uv/
+dist/
+build/
+*.egg-info/
+
+# IDE & OS files
+.vscode/
+.DS_Store
+Thumbs.db
