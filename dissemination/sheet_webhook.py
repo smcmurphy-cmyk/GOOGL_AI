@@ -39,6 +39,7 @@ async def post_to_sheet(
 
     # Build the flat JSON payload matching the NEW feedback loop schema
     payload = {
+        "tab_name": "Trade Candidates",
         "alert_id": alert_id,
         "timestamp": timestamp,
         "ticker": ticker,
@@ -68,4 +69,27 @@ async def post_to_sheet(
             return True
     except Exception as e:
         print(f"Webhook POST failed for {ticker}: {e}")
+        return False
+
+
+async def post_market_scan(ticker: str, regime: RegimeState, reject_reason: str) -> bool:
+    """
+    POSTs rejected opportunities directly to the Market Scans tab.
+    """
+    payload = {
+        "tab_name": "Market Scans",
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "ticker": ticker,
+        "regime": regime.regime_type,
+        "net_gex": round(regime.net_gex, 2),
+        "reject_reason": reject_reason
+    }
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.post(config.webhook_url, json=payload, timeout=10.0)
+            response.raise_for_status()
+            return True
+    except Exception as e:
+        print(f"  [Debug] Market Scan POST failed for {ticker}: {e}")
         return False

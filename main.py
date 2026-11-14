@@ -9,7 +9,7 @@ from core_logic.structure_builder import generate_structures
 from core_logic.expectancy_scorer import evaluate_and_rank
 from core_logic.portfolio_risk import portfolio_gatekeeper
 from synthesis.agent_llm import generate_trade_thesis
-from dissemination.sheet_webhook import post_to_sheet
+from dissemination.sheet_webhook import post_to_sheet, post_market_scan
 
 # Update import to reflect accurate naming
 from utils.volatility import get_historical_volatility_rank
@@ -37,11 +37,20 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     
     regime = classify_regime(chain, historical_vol_rank)
     print(f"      -> {regime.regime_type} (GEX: ${regime.net_gex:,.0f})") 
-
-    if not regime.is_tradeable:
-        print(f"[-] {ticker} regime is UNCERTAIN. Skipping.") 
-        return session_open_risk_usd 
-
+    
+    # --- NEW PHASE 2: OPPORTUNITY FILTER ---
+    from core_logic.opportunity_filter import is_viable_scalp_environment
+    
+    is_viable, reject_reason = is_viable_scalp_environment(chain, regime)
+    
+    if not is_viable:
+        print(f"[-] Opportunity Rejected: {reject_reason}") 
+        
+        # ACTIVATE MARKET SCAN LOGGING
+        await post_market_scan(ticker, regime, reject_reason)
+        
+        return session_open_risk_usd
+    
     # STATE 3: STRUCTURE GENERATION
     print("[3/6] Generating Defined-Risk Structures...")
     structures = generate_structures(chain, regime)
@@ -88,26 +97,57 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
 async def main():
     print("INITIALIZING MEGA-CAP OPTIONS AGENT...")
     
-    # Fetch the Access Token ONCE per session to avoid rate limits
-    session_access_token = None
-    if config.use_live_schwab_data:
-        print("[+] Authenticating with Schwab API...")
-        session_access_token = await get_valid_access_token()
-        print("[+] Live Token Acquired.")
-
-    # Track accumulated risk across the session to feed the gatekeeper
-    session_open_risk_usd = 0.0 
-    
-    for ticker in MEGA_CAP_TICKERS:
-        session_open_risk_usd = await run_pipeline(
-            ticker, 
-            session_open_risk_usd, 
-            access_token=session_access_token
-        ) 
-        await asyncio.sleep(2) 
+    while True:
+        # 1. Check if we are inside the morning rush window
+        from datetime import datetime, time
+        import pytz
         
-    print("\nSESSION COMPLETE.") 
-    print(f"Total Projected Risk Allocated: ${session_open_risk_usd:,.2f}")
+        nyc_tz = pytz.timezone('America/New_York')
+        now = datetime.now(nyc_tz).time()
+        
+        # Match the target window: 9:35 to 11:00 EST (6:35 to 8:00 PST)
+        market_open = time(9, 35)
+        market_close = time(11, 0)
+        
+        if not (market_open <= now <= market_close):
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Outside morning scalp window. Sleeping for 60 seconds...")
+            await asyncio.sleep(60)
+            continue
+            
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] WAKING AGENT FOR 2-MINUTE SCAN CYCLE...")
+
+        # 2. Fetch/Refresh the Access Token
+        session_access_token = None
+        if config.use_live_schwab_data:
+            print("[+] Authenticating with Schwab API...")
+            try:
+                session_access_token = await get_valid_access_token()
+                print("[+] Live Token Acquired.")
+            except Exception as e:
+                print(f"[-] Token acquisition failed: {e}. Retrying next cycle.")
+                await asyncio.sleep(60)
+                continue
+
+        # 3. Track accumulated risk across the session
+        session_open_risk_usd = 0.0 
+        
+        for ticker in MEGA_CAP_TICKERS:
+            session_open_risk_usd = await run_pipeline(
+                ticker, 
+                session_open_risk_usd, 
+                access_token=session_access_token
+            ) 
+            await asyncio.sleep(2) # Stagger requests to respect API rate limits
+            
+        print("\nSCAN CYCLE COMPLETE.") 
+        print(f"Total Projected Risk Allocated This Cycle: ${session_open_risk_usd:,.2f}")
+        
+        # 4. Sleep for exactly 2 minutes before the next scan
+        print("Agent resting for 2 minutes...")
+        await asyncio.sleep(120) 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nAgent gracefully shut down by user.")
