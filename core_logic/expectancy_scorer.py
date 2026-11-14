@@ -22,6 +22,16 @@ def evaluate_and_rank(
         reward = structure.net_premium
         risk = structure.max_risk
         
+       # Calculate true reward based on spread type
+        if "Debit" in structure.strategy_type:
+            width = abs(structure.legs[0].contract.strike - structure.legs[1].contract.strike)
+            # Both metrics standardized to total dollar amounts
+            risk = abs(structure.net_premium) * 100
+            reward = (width * 100) - risk
+        else:
+            reward = structure.net_premium * 100
+            risk = structure.max_risk
+        
         expectancy = (pop * reward) - ((1.0 - pop) * risk)
         
         if expectancy > 0 and risk > 0 and risk <= allowed_risk_dollars:

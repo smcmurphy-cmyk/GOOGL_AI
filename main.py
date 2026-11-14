@@ -11,8 +11,8 @@ from core_logic.portfolio_risk import portfolio_gatekeeper
 from synthesis.agent_llm import generate_trade_thesis
 from dissemination.sheet_webhook import post_to_sheet
 
-# FIX: Import the new yfinance volatility module
-from utils.volatility import get_real_iv_rank
+# Update import to reflect accurate naming
+from utils.volatility import get_historical_volatility_rank
 
 # Hardcoded for the test run. Later, move this to config/universe.py
 MEGA_CAP_TICKERS = ["TSLA", "QQQ", "SPY"]
@@ -21,22 +21,21 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     print(f"\n--- Starting Pipeline for {ticker} ---")
     print("[1/6] Ingesting Market Data...")
     
-    # 1. Route the data ingestion
     if config.use_live_schwab_data:
         chain = await get_schwab_data(ticker, access_token=access_token) 
     else:
-        print("  [Data] Using delayed CBOE feed (Weekend/Testing mode)...")
-        chain = get_cboe_data(ticker)
+        # Fix: Add await to the CBOE fallback
+        chain = await get_cboe_data(ticker)
         
     if not chain or not chain.contracts:
         return session_open_risk_usd
     
-    # FIX: Corrected indentation
-    live_iv_rank = get_real_iv_rank(ticker)
+
+    historical_vol_rank = get_historical_volatility_rank(ticker)
 
     print("[2/6] Classifying Macro Regime...")
     
-    regime = classify_regime(chain, live_iv_rank)
+    regime = classify_regime(chain, historical_vol_rank)
     print(f"      -> {regime.regime_type} (GEX: ${regime.net_gex:,.0f})") 
 
     if not regime.is_tradeable:

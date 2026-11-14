@@ -102,7 +102,8 @@ async def get_live_market_data(
                             vega=float(c_data.get('vega', 0.0))
                         ))
 
-            return OptionsChain(
+        # FIX: De-indented to sit outside the 'for opt_type' loop
+        return OptionsChain(
             underlying={
                 "price": underlying_price, 
                 "ticker": ticker, 

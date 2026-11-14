@@ -13,36 +13,55 @@ async def post_to_sheet(
     """
     Formats the trade data into the flat JSON schema and POSTs it to the webhook.
     """
-    # Extract readable string representations for the structure
     strategy = play.structure.strategy_type.replace('_', ' ').title()
-    if hasattr(play.structure, 'short_leg'):
-        contracts_str = f"+1 {play.structure.long_leg.strike} / -1 {play.structure.short_leg.strike}"
-        dte = (play.structure.long_leg.expiration - datetime.now().date()).days
+    
+    # Safely extract legs from the OptionStructure schema
+    short_leg = next((leg for leg in play.structure.legs if leg.action == "SELL"), None)
+    long_leg = next((leg for leg in play.structure.legs if leg.action == "BUY"), None)
+    
+    if short_leg and long_leg:
+        contracts_str = f"+1 {long_leg.contract.strike} / -1 {short_leg.contract.strike}"
+        dte = (long_leg.contract.expiration - datetime.now().date()).days
+    elif short_leg:
+        contracts_str = f"Short {short_leg.contract.strike}"
+        dte = (short_leg.contract.expiration - datetime.now().date()).days
     else:
-        contracts_str = f"Target {play.structure.contract.strike}"
-        dte = (play.structure.contract.expiration - datetime.now().date()).days
+        contracts_str = "N/A"
+        dte = 0
 
-    # Build the flat JSON payload matching the Google Sheet columns
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # Generate unique ID for closing the loop later
+    alert_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{ticker}-{strategy.replace(' ', '')}"
+    
+    target_exit = play.exits.profit_target_pct if play.exits else 0.50
+    stop_loss = play.exits.stop_loss_pct if play.exits else 1.00
+    invalidation = play.exits.invalidation_level if play.exits else "N/A"
+
+    # Build the flat JSON payload matching the NEW feedback loop schema
     payload = {
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "alert_id": alert_id,
+        "timestamp": timestamp,
         "ticker": ticker,
         "regime": f"{regime.regime_type} (Net GEX: {regime.net_gex:,.0f})",
         "structure": strategy,
         "contracts": contracts_str,
         "dte": dte,
-        "iv_rank": round(regime.iv_rank, 2) if regime.iv_rank else None,
-        "entry_premium": round(play.structure.entry_premium, 2) if hasattr(play.structure, 'entry_premium') else 0.0,
-        "max_risk_usd": round(play.account_risk_usd, 2),
-        "target_exit_usd": round(play.structure.target_exit_premium, 2) if hasattr(play.structure, 'target_exit_premium') else None,
-        "invalidation_usd": round(play.structure.stop_loss_premium, 2) if hasattr(play.structure, 'stop_loss_premium') else 0.0,
+        "entry_premium": round(play.structure.net_premium, 2),
+        "max_risk_usd": round(play.structure.max_risk, 2),
+        "planned_target": target_exit,
+        "planned_stop": stop_loss,
+        "invalidation": invalidation,
         "status": "OPEN",
-        "actual_exit_usd": None,
-        "r_multiple": round(play.score, 2),
-        "exit_reason": thesis 
+        "actual_exit_premium": None,
+        "exit_timestamp": None,
+        "exit_reason": None,
+        "realized_r": None,
+        "realized_pnl_usd": None,
+        "r_multiple": round(play.expectancy_score, 2),
+        "notes": thesis 
     }
 
     try:
-        # FIX: Added follow_redirects=True to handle Google Apps Script 302 responses
         async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.post(config.webhook_url, json=payload, timeout=10.0)
             response.raise_for_status()

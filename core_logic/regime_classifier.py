@@ -15,13 +15,13 @@ def classify_regime(
     # 2. Minimum liquidity check
     is_tradeable = len(profile.sorted_strikes) >= 15
     
-    # 3. Classify the regime based on Net GEX and IV Rank
+    # Positive GEX dampens moves (Mean Reversion), Negative GEX amplifies moves (Directional)
     regime_type = "UNCERTAIN"
     
-    if profile.net_gex > gex_threshold and iv_rank < iv_rank_threshold:
-        regime_type = "DIRECTIONAL_BREAKOUT"
-    elif profile.net_gex < -gex_threshold or iv_rank >= iv_rank_threshold:
+    if profile.net_gex > gex_threshold:
         regime_type = "MEAN_REVERSION"
+    elif profile.net_gex < -gex_threshold:
+        regime_type = "DIRECTIONAL_BREAKOUT"
         
     return RegimeState(
         regime_type=regime_type,

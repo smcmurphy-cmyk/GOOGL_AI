@@ -22,20 +22,44 @@ def get_wing_contract(contracts: List[OptionContract], short_strike: float, dire
         return max(candidates, key=lambda c: c.strike) if candidates else None
 
 def generate_structures(chain: OptionsChain, regime: RegimeState) -> List[OptionStructure]:
-    """
-    Constructs defined-risk vertical spreads (Credit/Debit) using GEX Topography mapping.
-    """
     structures = []
-    
-    # 10 DTE window to capture liquid Friday OPEX walls
-    target_dte = 10 
     today = date.today()
     
-    valid_calls = [c for c in chain.contracts if c.option_type == "call" and (c.expiration - today).days <= target_dte]
-    valid_puts = [c for c in chain.contracts if c.option_type == "put" and (c.expiration - today).days <= target_dte]
+    # Tighten window to true scalping timeframe
+    target_dte = 3 
+    
+    valid_calls = [c for c in chain.contracts if c.option_type == "call" and 0 <= (c.expiration - today).days <= target_dte]
+    valid_puts = [c for c in chain.contracts if c.option_type == "put" and 0 <= (c.expiration - today).days <= target_dte]
     
     if not valid_calls or not valid_puts:
         return structures
+
+    if regime.regime_type in ["MEAN_REVERSION", "PINNED_BULLISH", "PINNED_BEARISH"]:
+        
+        # Bear Call Credit Spread
+        if regime.call_wall:
+            short_call = get_nearest_liquid_contract(valid_calls, regime.call_wall)
+            
+            # Enforce Delta Band (e.g., 0.15 to 0.35)
+            if short_call and short_call.delta and 0.15 <= abs(short_call.delta) <= 0.35:
+                long_call = get_wing_contract(valid_calls, short_call.strike, "up")
+                
+                if long_call and short_call.bid > long_call.ask:
+                    net_credit = short_call.bid - long_call.ask
+                    width = long_call.strike - short_call.strike
+                    
+                    # Enforce Minimum Credit to Width Ratio (e.g., collect at least 1/3 the width)
+                    if (net_credit / width) >= 0.30:
+                        structures.append(OptionStructure(
+                            strategy_type="Bear Call Spread",
+                            legs=[
+                                Leg(contract=short_call, action="SELL", ratio=1),
+                                Leg(contract=long_call, action="BUY", ratio=1)
+                            ],
+                            net_premium=net_credit,
+                            max_risk=(width - net_credit) * 100,
+                            probability_of_profit=1.0 - abs(short_call.delta)
+                        ))
 
     # ---------------------------------------------------------
     # REGIME: MEAN REVERSION or PINNED (Fading the extremes)

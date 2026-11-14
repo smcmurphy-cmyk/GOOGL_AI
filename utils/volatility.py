@@ -2,7 +2,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-def get_real_iv_rank(ticker: str) -> float:
+def get_historical_volatility_rank(ticker: str) -> float:
     """
     Uses yfinance to calculate a 1-year Historical Volatility Rank 
     to replace mocked IV data.
