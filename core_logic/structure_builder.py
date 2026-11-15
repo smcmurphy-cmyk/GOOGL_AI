@@ -1,159 +1,109 @@
-from typing import List, Optional
 from datetime import date
+from typing import List
 from models.market_data import OptionsChain, OptionContract
-from models.regime import RegimeState
 from models.structures import OptionStructure, Leg
+from models.regime import RegimeState
 
-def get_nearest_liquid_contract(contracts: List[OptionContract], target_strike: float, min_bid: float = 0.10, min_oi: int = 15) -> Optional[OptionContract]:
-    """Finds the most liquid contract closest to the GEX topography target."""
-    valid_contracts = [c for c in contracts if c.bid >= min_bid and (c.open_interest or 0) >= min_oi]
-    if not valid_contracts:
+def get_nearest_liquid_contract(contracts: List[OptionContract], target_strike: float) -> OptionContract:
+    """Finds the contract closest to the target strike, prioritizing volume if equidistant."""
+    if not contracts:
         return None
-    # Sort by absolute distance to the target strike and return the closest one
-    return min(valid_contracts, key=lambda c: abs(c.strike - target_strike))
+    return sorted(contracts, key=lambda c: (abs(c.strike - target_strike), -(c.volume or 0)))[0]
 
-def get_wing_contract(contracts: List[OptionContract], short_strike: float, direction: str, min_width: float = 1.0) -> Optional[OptionContract]:
-    """Dynamically finds the next available strike to act as the defined-risk wing."""
-    if direction == "up":
-        candidates = [c for c in contracts if c.strike >= short_strike + min_width]
-        return min(candidates, key=lambda c: c.strike) if candidates else None
-    else:
-        candidates = [c for c in contracts if c.strike <= short_strike - min_width]
-        return max(candidates, key=lambda c: c.strike) if candidates else None
+def get_wing_contract(contracts: List[OptionContract], short_strike: float, direction: str, width: float = 5.0) -> OptionContract:
+    """Selects the protective wing contract dynamically based on width."""
+    target = short_strike + width if direction == "up" else short_strike - width
+    return get_nearest_liquid_contract(contracts, target)
 
 def generate_structures(chain: OptionsChain, regime: RegimeState) -> List[OptionStructure]:
     structures = []
     today = date.today()
     
-    # Tighten window to true scalping timeframe
-    target_dte = 3 
-    
-    valid_calls = [c for c in chain.contracts if c.option_type == "call" and 0 <= (c.expiration - today).days <= target_dte]
-    valid_puts = [c for c in chain.contracts if c.option_type == "put" and 0 <= (c.expiration - today).days <= target_dte]
+    # P2.9: Strict 0-3 DTE Scalping Window
+    valid_calls = [c for c in chain.contracts if c.option_type == "call" and 0 <= (c.expiration - today).days <= 3]
+    valid_puts = [c for c in chain.contracts if c.option_type == "put" and 0 <= (c.expiration - today).days <= 3]
     
     if not valid_calls or not valid_puts:
         return structures
 
-    if regime.regime_type in ["MEAN_REVERSION", "PINNED_BULLISH", "PINNED_BEARISH"]:
+    # P0.1 & P1.6: MEAN REVERSION (Credit Spreads at Walls)
+    if regime.regime_type == "MEAN_REVERSION":
         
-        # Bear Call Credit Spread
+        # Bear Call Spread @ Call Wall
         if regime.call_wall:
             short_call = get_nearest_liquid_contract(valid_calls, regime.call_wall)
-            
-            # Enforce Delta Band (e.g., 0.15 to 0.35)
+            # Enforce 15-35 Delta Band
             if short_call and short_call.delta and 0.15 <= abs(short_call.delta) <= 0.35:
                 long_call = get_wing_contract(valid_calls, short_call.strike, "up")
-                
                 if long_call and short_call.bid > long_call.ask:
                     net_credit = short_call.bid - long_call.ask
                     width = long_call.strike - short_call.strike
-                    
-                    # Enforce Minimum Credit to Width Ratio (e.g., collect at least 1/3 the width)
-                    if (net_credit / width) >= 0.30:
+                    # Enforce >= 30% Credit-to-Width Ratio
+                    if width > 0 and (net_credit / width) >= 0.30: 
                         structures.append(OptionStructure(
                             strategy_type="Bear Call Spread",
-                            legs=[
-                                Leg(contract=short_call, action="SELL", ratio=1),
-                                Leg(contract=long_call, action="BUY", ratio=1)
-                            ],
+                            legs=[Leg(contract=short_call, action="SELL", ratio=1), Leg(contract=long_call, action="BUY", ratio=1)],
                             net_premium=net_credit,
                             max_risk=(width - net_credit) * 100,
                             probability_of_profit=1.0 - abs(short_call.delta)
                         ))
-
-    # ---------------------------------------------------------
-    # REGIME: MEAN REVERSION or PINNED (Fading the extremes)
-    # ---------------------------------------------------------
-    if regime.regime_type in ["MEAN_REVERSION", "PINNED_BULLISH", "PINNED_BEARISH"]:
         
-        # 1. Bear Call Credit Spread (Fading the Call Wall)
-        if regime.call_wall:
-            short_call = get_nearest_liquid_contract(valid_calls, regime.call_wall)
-            if short_call:
-                long_call = get_wing_contract(valid_calls, short_call.strike, "up")
-                
-                if long_call and short_call.bid > long_call.ask:
-                    net_credit = short_call.bid - long_call.ask
-                    width = long_call.strike - short_call.strike
-                    structures.append(OptionStructure(
-                        strategy_type="Bear Call Spread",
-                        legs=[
-                            Leg(contract=short_call, action="SELL", ratio=1),
-                            Leg(contract=long_call, action="BUY", ratio=1)
-                        ],
-                        net_premium=net_credit,
-                        max_risk=(width - net_credit) * 100,
-                        probability_of_profit=1.0 - abs(short_call.delta if short_call.delta else 0.5)
-                    ))
-                    
-        # 2. Bull Put Credit Spread (Fading the Put Wall)
+        # Bull Put Spread @ Put Wall
         if regime.put_wall:
             short_put = get_nearest_liquid_contract(valid_puts, regime.put_wall)
-            if short_put:
+            # Enforce 15-35 Delta Band
+            if short_put and short_put.delta and 0.15 <= abs(short_put.delta) <= 0.35:
                 long_put = get_wing_contract(valid_puts, short_put.strike, "down")
-                
                 if long_put and short_put.bid > long_put.ask:
                     net_credit = short_put.bid - long_put.ask
                     width = short_put.strike - long_put.strike
-                    structures.append(OptionStructure(
-                        strategy_type="Bull Put Spread",
-                        legs=[
-                            Leg(contract=short_put, action="SELL", ratio=1),
-                            Leg(contract=long_put, action="BUY", ratio=1)
-                        ],
-                        net_premium=net_credit,
-                        max_risk=(width - net_credit) * 100,
-                        probability_of_profit=1.0 - abs(short_put.delta if short_put.delta else 0.5)
-                    ))
-
-    # ---------------------------------------------------------
-    # REGIME: DIRECTIONAL BREAKOUT (Riding the momentum)
-    # ---------------------------------------------------------
+                    # Enforce >= 30% Credit-to-Width Ratio
+                    if width > 0 and (net_credit / width) >= 0.30:
+                        structures.append(OptionStructure(
+                            strategy_type="Bull Put Spread",
+                            legs=[Leg(contract=short_put, action="SELL", ratio=1), Leg(contract=long_put, action="BUY", ratio=1)],
+                            net_premium=net_credit,
+                            max_risk=(width - net_credit) * 100,
+                            probability_of_profit=1.0 - abs(short_put.delta)
+                        ))
+    
+    # DIRECTIONAL BREAKOUT (Debit Spreads at Gamma Flip)
     elif regime.regime_type == "DIRECTIONAL_BREAKOUT" and regime.gamma_flip:
-        spot = chain.underlying.price
+        spot = chain.underlying.get("price", 0.0)
         
-        # 1. Bearish Breakout (Spot drops below Flip Line)
+        # Spot below flip: Downward Momentum -> Bear Put Debit
         if spot < regime.gamma_flip:
-            long_put = get_nearest_liquid_contract(valid_puts, regime.gamma_flip)
+            long_put = get_nearest_liquid_contract(valid_puts, spot) 
             if long_put:
                 short_put = get_wing_contract(valid_puts, long_put.strike, "down")
-                
                 if short_put and long_put.ask > short_put.bid:
                     net_debit = long_put.ask - short_put.bid
                     width = long_put.strike - short_put.strike
-                    
-                    if net_debit < width: # Valid spread pricing check
+                    # Enforce max 50% debit-to-width ratio for >1:1 R/R
+                    if width > 0 and (net_debit / width) <= 0.50:
                         structures.append(OptionStructure(
                             strategy_type="Bear Put Debit Spread",
-                            legs=[
-                                Leg(contract=long_put, action="BUY", ratio=1),
-                                Leg(contract=short_put, action="SELL", ratio=1)
-                            ],
-                            net_premium=-net_debit, # Negative to mathematically separate cost from credit
+                            legs=[Leg(contract=long_put, action="BUY", ratio=1), Leg(contract=short_put, action="SELL", ratio=1)],
+                            net_premium=-net_debit,  # Negative for debit
                             max_risk=net_debit * 100,
-                            probability_of_profit=abs(long_put.delta if long_put.delta else 0.5)
+                            probability_of_profit=0.50 # Standard proxy for ATM debit spreads
                         ))
-
-        # 2. Bullish Breakout (Spot breaks above Flip Line)
+                        
+        # Spot above flip: Upward Momentum -> Bull Call Debit
         elif spot > regime.gamma_flip:
-            long_call = get_nearest_liquid_contract(valid_calls, regime.gamma_flip)
+            long_call = get_nearest_liquid_contract(valid_calls, spot) 
             if long_call:
                 short_call = get_wing_contract(valid_calls, long_call.strike, "up")
-                
                 if short_call and long_call.ask > short_call.bid:
                     net_debit = long_call.ask - short_call.bid
                     width = short_call.strike - long_call.strike
-                    
-                    if net_debit < width: # Valid spread pricing check
+                    if width > 0 and (net_debit / width) <= 0.50:
                         structures.append(OptionStructure(
                             strategy_type="Bull Call Debit Spread",
-                            legs=[
-                                Leg(contract=long_call, action="BUY", ratio=1),
-                                Leg(contract=short_call, action="SELL", ratio=1)
-                            ],
-                            net_premium=-net_debit, # Negative to mathematically separate cost from credit
+                            legs=[Leg(contract=long_call, action="BUY", ratio=1), Leg(contract=short_call, action="SELL", ratio=1)],
+                            net_premium=-net_debit,
                             max_risk=net_debit * 100,
-                            probability_of_profit=abs(long_call.delta if long_call.delta else 0.5)
+                            probability_of_profit=0.50 
                         ))
-
+                        
     return structures

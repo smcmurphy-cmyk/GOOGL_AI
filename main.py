@@ -17,7 +17,7 @@ from utils.volatility import get_historical_volatility_rank
 # Hardcoded for the test run. Later, move this to config/universe.py
 MEGA_CAP_TICKERS = ["TSLA", "QQQ", "SPY"]
 
-async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: str = None):
+async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: str = None, positions_this_cycle: int = 0):
     print(f"\n--- Starting Pipeline for {ticker} ---")
     print("[1/6] Ingesting Market Data...")
     
@@ -28,7 +28,7 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
         chain = await get_cboe_data(ticker)
         
     if not chain or not chain.contracts:
-        return session_open_risk_usd
+        return session_open_risk_usd, positions_this_cycle
     
 
     historical_vol_rank = get_historical_volatility_rank(ticker)
@@ -49,14 +49,14 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
         # ACTIVATE MARKET SCAN LOGGING
         await post_market_scan(ticker, regime, reject_reason)
         
-        return session_open_risk_usd
+        return session_open_risk_usd, positions_this_cycle
     
     # STATE 3: STRUCTURE GENERATION
     print("[3/6] Generating Defined-Risk Structures...")
     structures = generate_structures(chain, regime)
     if not structures:
         print(f"[-] No valid structures found for {ticker} in current regime.")
-        return session_open_risk_usd 
+        return session_open_risk_usd, positions_this_cycle 
 
     # STATE 4: EXPECTANCY SCORING
     print(f"[4/6] Scoring Expectancy on {len(structures)} candidate structures...")
@@ -66,7 +66,7 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     
     if not scored_plays:
         print("[-] No structures passed the strict R-Multiple and Risk limits.")
-        return session_open_risk_usd 
+        return session_open_risk_usd, positions_this_cycle 
         
     top_play = scored_plays[0]
     
@@ -75,9 +75,20 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
 
     # STATE 5: PORTFOLIO GATEKEEPER
     print("[5/6] Checking Portfolio Risk Budget...")
-    if not portfolio_gatekeeper(top_play, session_open_risk_usd, account_balance=10000.0):
-        print("[-] Trade rejected: Executing this would breach maximum daily risk.")
-        return session_open_risk_usd 
+    # Passed positions_this_cycle into run_pipeline() as a parameter to feed this gatekeeper.
+    is_approved, reject_reason = portfolio_gatekeeper(
+        top_play, 
+        session_open_risk_usd, 
+        historical_vol_rank, 
+        positions_this_cycle=positions_this_cycle, 
+        account_balance=10000.0
+    )
+    
+    if not is_approved:
+         print(f"[-] Trade rejected: {reject_reason}")
+         # Log portfolio rejections to Market Scans so you know you had an edge but lacked capital
+         await post_market_scan(ticker, regime, f"Risk Gate: {reject_reason}")
+         return session_open_risk_usd, positions_this_cycle 
 
     # STATE 6: SYNTHESIS & DISSEMINATION
     print("[6/6] Synthesizing LLM Thesis and Dispatching Webhook...")
@@ -88,11 +99,11 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     
     if success:
         print("[+] Alert successfully dispatched!")
-        # FIX: Mapped risk tracking to the new OptionStructure max_risk field
-        return session_open_risk_usd + top_play.structure.max_risk
+        # Mapped risk tracking to the new OptionStructure max_risk field and increment positions
+        return session_open_risk_usd + top_play.structure.max_risk, positions_this_cycle + 1
     else:
         print("[-] Failed to dispatch webhook.")
-        return session_open_risk_usd 
+        return session_open_risk_usd, positions_this_cycle 
 
 async def main():
     print("INITIALIZING MEGA-CAP OPTIONS AGENT...")
@@ -130,12 +141,14 @@ async def main():
 
         # 3. Track accumulated risk across the session
         session_open_risk_usd = 0.0 
+        positions_this_cycle = 0
         
         for ticker in MEGA_CAP_TICKERS:
-            session_open_risk_usd = await run_pipeline(
+            session_open_risk_usd, positions_this_cycle = await run_pipeline(
                 ticker, 
                 session_open_risk_usd, 
-                access_token=session_access_token
+                access_token=session_access_token,
+                positions_this_cycle=positions_this_cycle
             ) 
             await asyncio.sleep(2) # Stagger requests to respect API rate limits
             

@@ -4,9 +4,9 @@ from utils.greeks import calculate_gex_profile
 
 def classify_regime(
     chain: OptionsChain, 
-    iv_rank: float, 
+    hv_rank: float, 
     gex_threshold: float = 5_000_000.0,
-    iv_rank_threshold: float = 50.0      
+    hv_threshold: float = 50.0      
 ) -> RegimeState:
     
     # 1. Calculate the GEX topography
@@ -18,16 +18,17 @@ def classify_regime(
     # Positive GEX dampens moves (Mean Reversion), Negative GEX amplifies moves (Directional)
     regime_type = "UNCERTAIN"
     
-    if profile.net_gex > gex_threshold:
+# P0.2: Dual-factor logic utilizing both Net GEX and Historical Volatility Rank
+    if profile.net_gex > gex_threshold and hv_rank >= hv_threshold:
         regime_type = "MEAN_REVERSION"
-    elif profile.net_gex < -gex_threshold:
+    elif profile.net_gex < -gex_threshold and hv_rank < hv_threshold:
         regime_type = "DIRECTIONAL_BREAKOUT"
         
     return RegimeState(
         regime_type=regime_type,
         net_gex=profile.net_gex,
         gamma_flip=profile.gamma_flip,
-        call_wall=profile.call_wall,  
-        put_wall=profile.put_wall,   
+        call_wall=profile.call_wall,   
+        put_wall=profile.put_wall,     
         is_tradeable=is_tradeable
     )
