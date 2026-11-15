@@ -17,7 +17,10 @@ from utils.volatility import get_historical_volatility_rank
 # Hardcoded for the test run. Later, move this to config/universe.py
 MEGA_CAP_TICKERS = ["TSLA", "QQQ", "SPY"]
 
-async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: str = None, positions_this_cycle: int = 0):
+async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: str = None, positions_this_cycle: int = 0, dispatched_alerts: set = None):
+    if dispatched_alerts is None:
+        dispatched_alerts = set()
+
     print(f"\n--- Starting Pipeline for {ticker} ---")
     print("[1/6] Ingesting Market Data...")
     
@@ -62,7 +65,9 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     print(f"[4/6] Scoring Expectancy on {len(structures)} candidate structures...")
     
     # Passed ticker back into the scorer
-    scored_plays = evaluate_and_rank(structures, regime, ticker)
+    # P0 FIX: Pass spot into evaluate_and_rank
+    spot = chain.underlying.price
+    scored_plays = evaluate_and_rank(structures, regime, ticker, spot)
     
     if not scored_plays:
         print("[-] No structures passed the strict R-Multiple and Risk limits.")
@@ -75,6 +80,12 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
 
     # STATE 5: PORTFOLIO GATEKEEPER
     print("[5/6] Checking Portfolio Risk Budget...")
+    
+    trade_id = f"{ticker}-{top_play.structure.strategy_type}"
+    if trade_id in dispatched_alerts:
+        print(f"[-] Alert suppressed: {trade_id} already dispatched today.")
+        return session_open_risk_usd, positions_this_cycle
+
     # Passed positions_this_cycle into run_pipeline() as a parameter to feed this gatekeeper.
     is_approved, reject_reason = portfolio_gatekeeper(
         top_play, 
@@ -92,14 +103,15 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
 
     # STATE 6: SYNTHESIS & DISSEMINATION
     print("[6/6] Synthesizing LLM Thesis and Dispatching Webhook...")
-    thesis = generate_trade_thesis(ticker, regime, top_play)
-    
+    # P1 FIX: Offload synchronous LLM generation to a separate thread to prevent blocking the async pipeline
+    thesis = await asyncio.to_thread(generate_trade_thesis, ticker, regime, top_play)
+      
     # POST to webhook (Ensure your .env has WEBHOOK_URL defined)
     success = await post_to_sheet(ticker, regime, top_play, thesis)
     
     if success:
         print("[+] Alert successfully dispatched!")
-        # Mapped risk tracking to the new OptionStructure max_risk field and increment positions
+        dispatched_alerts.add(trade_id) # Lock out this setup until reset
         return session_open_risk_usd + top_play.structure.max_risk, positions_this_cycle + 1
     else:
         print("[-] Failed to dispatch webhook.")
@@ -107,7 +119,12 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
 
 async def main():
     print("INITIALIZING MEGA-CAP OPTIONS AGENT...")
+    # P0 FIX: Initialize state OUTSIDE the infinite loop so it persists across cycles
+    session_open_risk_usd = 0.0 
     
+    # P1 FIX: Track dispatched trades by ticker+strategy to prevent spamming the same setup
+    dispatched_alerts = set()
+
     while True:
         # 1. Check if we are inside the morning rush window
         from datetime import datetime, time
@@ -140,15 +157,17 @@ async def main():
                 continue
 
         # 3. Track accumulated risk across the session
-        session_open_risk_usd = 0.0 
+        
         positions_this_cycle = 0
         
         for ticker in MEGA_CAP_TICKERS:
+            # Pass the dispatched_alerts set into the pipeline
             session_open_risk_usd, positions_this_cycle = await run_pipeline(
                 ticker, 
                 session_open_risk_usd, 
                 access_token=session_access_token,
-                positions_this_cycle=positions_this_cycle
+                positions_this_cycle=positions_this_cycle,
+                dispatched_alerts=dispatched_alerts
             ) 
             await asyncio.sleep(2) # Stagger requests to respect API rate limits
             

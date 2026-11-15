@@ -18,7 +18,7 @@ def classify_regime(
     # Positive GEX dampens moves (Mean Reversion), Negative GEX amplifies moves (Directional)
     regime_type = "UNCERTAIN"
     
-# P0.2: Dual-factor logic utilizing both Net GEX and Historical Volatility Rank
+    # P0.2: Dual-factor logic utilizing both Net GEX and Historical Volatility Rank
     if profile.net_gex > gex_threshold and hv_rank >= hv_threshold:
         regime_type = "MEAN_REVERSION"
     elif profile.net_gex < -gex_threshold and hv_rank < hv_threshold:

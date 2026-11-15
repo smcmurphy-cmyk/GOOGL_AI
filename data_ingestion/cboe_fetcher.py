@@ -2,6 +2,7 @@ import asyncio
 from curl_cffi.requests import AsyncSession
 import yfinance as yf
 from datetime import datetime, date
+from pydantic import ValidationError
 from models.market_data import UnderlyingQuote, OptionContract, OptionsChain
 
 async def fetch_underlying(ticker: str) -> UnderlyingQuote:
@@ -112,7 +113,7 @@ async def get_market_data(ticker: str) -> OptionsChain:
 
             contract = OptionContract(
                 ticker=ticker,
-                strike=parsed_strike,  # <-- Update this line to use parsed_strike
+                strike=parsed_strike, 
                 expiration=exp_date,
                 option_type="call" if is_call else "put",
                 
@@ -130,9 +131,12 @@ async def get_market_data(ticker: str) -> OptionsChain:
             )
             contracts.append(contract)
                       
+        except ValidationError as e:
+            # P1 FIX: Silently drop the malformed contract and continue parsing the rest
+            continue
         except Exception as e:
+            # If it's a completely unexpected failure, log it but still continue to the next item
             print(f"\n[!] PARSING ERROR on {ticker}: {type(e).__name__} - {e}")
-            print(f"[!] Raw JSON Item: {item}\n")
-            break
+            continue 
             
     return OptionsChain(underlying=underlying, contracts=contracts)

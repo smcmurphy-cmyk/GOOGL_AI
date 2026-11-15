@@ -9,9 +9,14 @@ def get_nearest_liquid_contract(contracts: List[OptionContract], target_strike: 
     if not contracts: return None
     return sorted(contracts, key=lambda c: (abs(c.strike - target_strike), -(c.volume or 0)))[0]
 
-def get_wing_contract(contracts: List[OptionContract], short_strike: float, direction: str, width: float = 5.0) -> OptionContract:
-    target = short_strike + width if direction == "up" else short_strike - width
-    return get_nearest_liquid_contract(contracts, target)
+def get_wing_contract(contracts: List[OptionContract], short_leg: OptionContract, direction: str, width: float = 5.0) -> OptionContract:
+    """Selects the protective wing contract dynamically, enforcing the exact same expiration date."""
+    target = short_leg.strike + width if direction == "up" else short_leg.strike - width
+    
+    # Enforce Calendar match
+    same_expiry_contracts = [c for c in contracts if c.expiration == short_leg.expiration]
+    
+    return get_nearest_liquid_contract(same_expiry_contracts, target)
 
 def generate_structures(chain: OptionsChain, regime: RegimeState) -> List[OptionStructure]:
     structures = []
@@ -47,7 +52,7 @@ def generate_structures(chain: OptionsChain, regime: RegimeState) -> List[Option
                         ))
                 else:
                     # Standard Bear Call Spread logic
-                    long_call = get_wing_contract(valid_calls, short_call.strike, "up")
+                    long_call = get_wing_contract(valid_calls, short_call, "up")
                     if long_call and short_call.bid > long_call.ask:
                         net_credit = short_call.bid - long_call.ask
                         width = long_call.strike - short_call.strike
@@ -78,7 +83,7 @@ def generate_structures(chain: OptionsChain, regime: RegimeState) -> List[Option
                         ))
                 else:
                     # Standard Bull Put Spread logic
-                    long_put = get_wing_contract(valid_puts, short_put.strike, "down")
+                    long_put = get_wing_contract(valid_puts, short_put, "down")
                     if long_put and short_put.bid > long_put.ask:
                         net_credit = short_put.bid - long_put.ask
                         width = short_put.strike - long_put.strike
@@ -92,7 +97,7 @@ def generate_structures(chain: OptionsChain, regime: RegimeState) -> List[Option
                             ))
     
     # DIRECTIONAL BREAKOUT (Debit Spreads & Flow Breakouts)
-    elif regime.regime_type == "DIRECTIONAL_BREAKOUT" and regime.gamma_flip:
+    elif regime.regime_type == "DIRECTIONAL_BREAKOUT" and regime.gamma_flip is not None:
         
         if spot < regime.gamma_flip: # Downward Momentum
             # Check for aggressive Put flow
@@ -111,7 +116,7 @@ def generate_structures(chain: OptionsChain, regime: RegimeState) -> List[Option
                 # Standard Bear Put Debit Spread logic
                 long_put = get_nearest_liquid_contract(valid_puts, spot) 
                 if long_put:
-                    short_put = get_wing_contract(valid_puts, long_put.strike, "down")
+                    short_put = get_wing_contract(valid_puts, long_put, "down")
                     if short_put and long_put.ask > short_put.bid:
                         net_debit = long_put.ask - short_put.bid
                         width = long_put.strike - short_put.strike
@@ -141,7 +146,7 @@ def generate_structures(chain: OptionsChain, regime: RegimeState) -> List[Option
                 # Standard Bull Call Debit Spread logic
                 long_call = get_nearest_liquid_contract(valid_calls, spot) 
                 if long_call:
-                    short_call = get_wing_contract(valid_calls, long_call.strike, "up")
+                    short_call = get_wing_contract(valid_calls, long_call, "up")
                     if short_call and long_call.ask > short_call.bid:
                         net_debit = long_call.ask - short_call.bid
                         width = short_call.strike - long_call.strike
