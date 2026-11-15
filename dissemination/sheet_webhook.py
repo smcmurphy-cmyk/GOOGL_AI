@@ -19,8 +19,12 @@ async def post_to_sheet(
     short_leg = next((leg for leg in play.structure.legs if leg.action == "SELL"), None)
     long_leg = next((leg for leg in play.structure.legs if leg.action == "BUY"), None)
     
+    # Handle both Spreads and Naked Longs/Shorts
     if short_leg and long_leg:
         contracts_str = f"+1 {long_leg.contract.strike} / -1 {short_leg.contract.strike}"
+        dte = (long_leg.contract.expiration - datetime.now().date()).days
+    elif long_leg:
+        contracts_str = f"Long {long_leg.contract.strike}"
         dte = (long_leg.contract.expiration - datetime.now().date()).days
     elif short_leg:
         contracts_str = f"Short {short_leg.contract.strike}"
@@ -30,14 +34,12 @@ async def post_to_sheet(
         dte = 0
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    # Generate unique ID for closing the loop later
     alert_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{ticker}-{strategy.replace(' ', '')}"
     
     target_exit = play.exits.profit_target_pct if play.exits else 0.50
     stop_loss = play.exits.stop_loss_pct if play.exits else 1.00
     invalidation = play.exits.invalidation_level if play.exits else "N/A"
 
-    # Build the flat JSON payload matching the NEW feedback loop schema
     payload = {
         "tab_name": "Trade Candidates",
         "alert_id": alert_id,

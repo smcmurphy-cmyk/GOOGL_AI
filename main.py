@@ -44,12 +44,12 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     is_viable, reject_reason = is_viable_scalp_environment(chain, regime)
     
     if not is_viable:
-        print(f"[-] Opportunity Rejected: {reject_reason}") 
+       print(f"[-] Opportunity Rejected: {reject_reason}") 
         
         # ACTIVATE MARKET SCAN LOGGING
-        await post_market_scan(ticker, regime, reject_reason)
+       await post_market_scan(ticker, regime, reject_reason)
         
-        return session_open_risk_usd, positions_this_cycle
+       return session_open_risk_usd, positions_this_cycle
     
     # STATE 3: STRUCTURE GENERATION
     print("[3/6] Generating Defined-Risk Structures...")
@@ -61,8 +61,8 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     # STATE 4: EXPECTANCY SCORING
     print(f"[4/6] Scoring Expectancy on {len(structures)} candidate structures...")
     
-    # FIX: Passed regime and ticker into the upgraded scorer
-    scored_plays = evaluate_and_rank(structures, regime, ticker, account_balance=10000.0)
+    # Passed ticker back into the scorer
+    scored_plays = evaluate_and_rank(structures, regime, ticker)
     
     if not scored_plays:
         print("[-] No structures passed the strict R-Multiple and Risk limits.")
