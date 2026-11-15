@@ -1,33 +1,27 @@
 from models.alerts import ScoredPlay
 
 def portfolio_gatekeeper(
-    candidate_play: ScoredPlay, 
+    top_play: ScoredPlay, 
     session_open_risk_usd: float, 
     hv_rank: float, 
-    positions_this_cycle: int,
+    positions_this_cycle: int, 
     account_balance: float = 10000.0
 ) -> tuple[bool, str]:
-    """
-    Evaluates a candidate trade against dynamic portfolio risk constraints.
-    Returns (Is_Approved, Reason).
-    """
-    # P1.8: Max positions per 2-minute cycle to prevent over-trading a single momentum burst
+    
+    # 1% max heat per cycle
+    max_heat_usd = account_balance * 0.01 
+    
+    # PHASE 2 FIX: Calculate True Trade Risk based on the planned Stop Loss, not total premium
+    true_trade_risk = top_play.structure.max_risk * top_play.exits.stop_loss_pct
+    
+    if true_trade_risk > max_heat_usd:
+        return False, f"True risk ${true_trade_risk:.2f} exceeds 1% limit (${max_heat_usd:.2f})"
+        
+    # Cap total session exposure at 3%
+    if session_open_risk_usd + true_trade_risk > (account_balance * 0.03):
+        return False, "Session risk exceeds 3% daily limit"
+        
     if positions_this_cycle >= 2:
-        return False, "Max positions per cycle reached."
-
-    # P1.7: Dynamic Position Sizing based on Volatility
-    # Standard risk is 1%, scale down to 0.5% if Historical Volatility is extremely high (> 80)
-    max_trade_risk_pct = 0.005 if hv_rank > 80.0 else 0.01
-    max_trade_risk_usd = account_balance * max_trade_risk_pct
-    
-    proposed_risk = candidate_play.structure.max_risk 
-    
-    if proposed_risk > max_trade_risk_usd:
-        return False, f"Trade risk (${proposed_risk:.2f}) exceeds dynamic per-trade sizing limit (${max_trade_risk_usd:.2f})."
+        return False, "Max positions per cycle reached"
         
-    # Standard 5% maximum daily portfolio heat limit
-    max_daily_risk = account_balance * 0.05
-    if (session_open_risk_usd + proposed_risk) > max_daily_risk:
-        return False, f"Trade breaches maximum daily risk budget of ${max_daily_risk:.2f}."
-        
-    return True, "Passed"
+    return True, ""

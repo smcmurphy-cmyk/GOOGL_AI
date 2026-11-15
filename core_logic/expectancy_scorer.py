@@ -26,11 +26,17 @@ def evaluate_and_rank(structures: list[OptionStructure], regime: RegimeState, ti
         
         is_naked_long = "Long Call" in structure.strategy_type or "Long Put" in structure.strategy_type
         
-        # P0 FIX: Define actual trading exits (50% target for spreads, 150% for naked longs)
+        # P0 FIX: Strict 25% stop-loss and 15-minute time limit for naked options
         target_pct = 1.50 if is_naked_long else 0.50
-        stop_pct = 1.00
+        stop_pct = 0.25 if is_naked_long else 1.00
+        time_stop = 15 if is_naked_long else 120
+
+        # PHASE 2 FIX: Realistic PoP override for asymmetrical naked long scalps
+        if is_naked_long:
+            # 150% reward vs 25% risk requires a highly precise barrier hit. 
+            # A 20% PoP prevents the scorer from rubber-stamping every ATM option.
+            pop = 0.20
         
-        # P0 FIX: Calculate expectancy based on PLANNED exits, not theoretical max width
         if is_naked_long or "Debit" in structure.strategy_type:
             max_risk = structure.max_risk
             reward = max_risk * target_pct
@@ -38,7 +44,7 @@ def evaluate_and_rank(structures: list[OptionStructure], regime: RegimeState, ti
         else: # Credit Spreads
             max_reward = structure.net_premium * 100
             reward = max_reward * target_pct
-            actual_risk = max_reward * stop_pct
+            actual_risk = structure.max_risk * stop_pct
             
             # Expected Move Context Penalty (Only applies to Credit Spreads with short strikes)
             if short_leg:
@@ -48,12 +54,13 @@ def evaluate_and_rank(structures: list[OptionStructure], regime: RegimeState, ti
         
         expectancy = (pop * reward) - ((1.0 - pop) * actual_risk)
         
-        # Only accept positive expectancy trades
+ # Only accept positive expectancy trades
         if expectancy > 0:
             exits = TradeExits(
                 profit_target_pct=target_pct, 
                 stop_loss_pct=stop_pct,
-                time_stop_days=0,
+                time_stop_days=0,               # FIXED: Satisfies Pydantic schema requirement
+                time_stop_minutes=time_stop,    # Applies the intraday time stop for the webhook
                 invalidation_level=regime.gamma_flip if regime.gamma_flip else spot
             )
             

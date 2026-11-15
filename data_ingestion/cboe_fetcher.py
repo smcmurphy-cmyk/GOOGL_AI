@@ -5,36 +5,30 @@ from datetime import datetime, date
 from pydantic import ValidationError
 from models.market_data import UnderlyingQuote, OptionContract, OptionsChain
 
-async def fetch_underlying(ticker: str) -> UnderlyingQuote:
-    """
-    Fetches the current underlying price with a weekend-safe historical fallback.
-    """
+def _sync_fetch_underlying(ticker: str) -> float:
+    """Synchronous yfinance call isolated for threading."""
     stock = yf.Ticker(ticker)
-    price = 0.0
-    
     try:
         info = stock.fast_info
-        price = (
-            getattr(info, "last_price", None)
-            or getattr(info, "regular_market_price", None)
-            or info.get("lastPrice")
-            or 0.0
-        )
+        return float(getattr(info, "last_price", None) or getattr(info, "regular_market_price", None) or 0.0)
     except Exception:
         pass
+    
+    try:
+        hist = stock.history(period="1d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return 0.0
 
-    # Fallback: Use the last close price if fast_info fails (critical for weekends)
-    if not price or price <= 0:
-        try:
-            hist = stock.history(period="5d")
-            if not hist.empty:
-                price = float(hist["Close"].iloc[-1])
-        except Exception:
-            pass
-
+async def fetch_underlying(ticker: str) -> UnderlyingQuote:
+    # PHASE 3 FIX: Offload spot price fetch to prevent I/O blocking
+    price = await asyncio.to_thread(_sync_fetch_underlying, ticker)
+    
     return UnderlyingQuote(
         ticker=ticker,
-        price=float(price or 0.0),
+        price=price,
         timestamp=datetime.utcnow().isoformat()
     )
 

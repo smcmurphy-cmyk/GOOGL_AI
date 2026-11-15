@@ -24,17 +24,19 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     print(f"\n--- Starting Pipeline for {ticker} ---")
     print("[1/6] Ingesting Market Data...")
     
-    if config.use_live_schwab_data:
-        chain = await get_schwab_data(ticker, access_token=access_token) 
-    else:
-        # Fix: Add await to the CBOE fallback
-        chain = await get_cboe_data(ticker)
+# PHASE 3 FIX: Strictly enforce live broker data. CBOE delayed quotes are toxic for 0-DTE scalping.
+    if not config.use_live_schwab_data:
+        print("[-] FATAL: Live Schwab data disabled. Scalping requires real-time quotes. Skipping...")
+        return session_open_risk_usd, positions_this_cycle
+        
+    chain = await get_schwab_data(ticker, access_token=access_token) 
         
     if not chain or not chain.contracts:
+        print(f"[-] No live chain data retrieved for {ticker}.")
         return session_open_risk_usd, positions_this_cycle
     
-
-    historical_vol_rank = get_historical_volatility_rank(ticker)
+    # PHASE 3 FIX: Offload synchronous yfinance network calls to a separate thread to prevent blocking
+    historical_vol_rank = await asyncio.to_thread(get_historical_volatility_rank, ticker)
 
     print("[2/6] Classifying Macro Regime...")
     
@@ -161,14 +163,20 @@ async def main():
         positions_this_cycle = 0
         
         for ticker in MEGA_CAP_TICKERS:
-            # Pass the dispatched_alerts set into the pipeline
-            session_open_risk_usd, positions_this_cycle = await run_pipeline(
-                ticker, 
-                session_open_risk_usd, 
-                access_token=session_access_token,
-                positions_this_cycle=positions_this_cycle,
-                dispatched_alerts=dispatched_alerts
-            ) 
+            # PHASE 1 FIX: Top-level exception handling prevents isolated data errors from crashing the agent
+            try:
+                session_open_risk_usd, positions_this_cycle = await run_pipeline(
+                    ticker, 
+                    session_open_risk_usd, 
+                    access_token=session_access_token,
+                    positions_this_cycle=positions_this_cycle,
+                    dispatched_alerts=dispatched_alerts
+                ) 
+            except Exception as e:
+                print(f"[-] CRITICAL PIPELINE ERROR for {ticker}: {type(e).__name__} - {e}")
+                # Failsafe: Continue to the next ticker so the bot stays alive
+                continue
+                
             await asyncio.sleep(2) # Stagger requests to respect API rate limits
             
         print("\nSCAN CYCLE COMPLETE.") 
