@@ -1,6 +1,9 @@
 import asyncio
 import datetime
 import pytz
+from data_ingestion.schwab_fetcher import get_price_history, build_2m, extract_levels_and_baseline
+from core_logic.breakout import evaluate_bar
+from core_logic.strategy_selector import select_strategy
 from config.settings import config
 
 # Import pipeline states
@@ -43,53 +46,69 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
         dispatched_alerts = set()
 
     print(f"\n--- Starting Pipeline for {ticker} ---")
-    print("[1/6] Ingesting Market Data...")
+    print("[1/6] Ingesting Market Data & Price History...")
     
     if not config.use_live_schwab_data:
         print("[-] FATAL: Live Schwab data disabled. Scalping requires real-time quotes. Skipping...")
         return session_open_risk_usd, positions_this_cycle
         
-    chain = await get_schwab_data(ticker, access_token=access_token) 
+    # Fetch live options chain and price history concurrently
+    chain_task = asyncio.create_task(get_schwab_data(ticker, access_token=access_token))
+    history_task = asyncio.create_task(get_price_history(ticker, access_token=access_token))
+    
+    chain, df1m = await asyncio.gather(chain_task, history_task)
         
-    if not chain or not chain.contracts:
-        print(f"[-] No live chain data retrieved for {ticker}.")
+    if not chain or not chain.contracts or df1m is None or df1m.empty:
+        print(f"[-] Missing chain or price history for {ticker}.")
         return session_open_risk_usd, positions_this_cycle
     
     historical_vol_rank = await asyncio.to_thread(get_historical_volatility_rank, ticker)
 
-    print("[2/6] Classifying Macro Regime...")
+    print("[2/6] Classifying Macro Regime & Evaluating Breakouts...")
     
     regime = classify_regime(chain, historical_vol_rank)
-    print(f"      -> {regime.regime_type} (GEX: ${regime.net_gex:,.0f})") 
     
     from core_logic.opportunity_filter import is_viable_scalp_environment
-    
     is_viable, reject_reason = is_viable_scalp_environment(chain, regime)
-    
     if not is_viable:
        print(f"[-] Opportunity Rejected: {reject_reason}") 
-       # REPLACED: Enqueue to background worker instead of blocking
        await enqueue_market_scan(ticker, regime, reject_reason)
        return session_open_risk_usd, positions_this_cycle
+       
+    # Execute the Micro Breakout Engine
+    now_et = datetime.datetime.now(pytz.timezone('US/Eastern'))
+    bars_2m = build_2m(df1m)
+    levels, rth_vol_stats = extract_levels_and_baseline(bars_2m, pd.Timestamp(now_et))
     
-    print("[3/6] Generating Defined-Risk Structures...")
-    structures = generate_structures(chain, regime)
+    breakout = evaluate_bar(bars_2m, pd.Timestamp(now_et), levels, rth_vol_stats)
+    
+    print(f"      -> Regime: {regime.regime_type} (GEX: ${regime.net_gex:,.0f})") 
+    print(f"      -> Breakout: {breakout.state} (Tier {breakout.tier}) | Signals: {breakout.signal_ids}")
+    
+    # Route to Strategy Selector
+    intent = select_strategy(regime, breakout)
+    if intent.strategy_type == "NO_TRADE":
+        print(f"[-] No valid trade setup for {regime.regime_type} + Breakout Tier {breakout.tier}")
+        await enqueue_market_scan(ticker, regime, "NO_TRADE: Matrix rejected setup.")
+        return session_open_risk_usd, positions_this_cycle
+    
+    print(f"[3/6] Generating Defined-Risk Structures ({intent.strategy_type})...")
+    structures = generate_structures(chain, regime, intent)
     if not structures:
-        print(f"[-] No valid structures found for {ticker} in current regime.")
+        print(f"[-] No liquid structures found for {ticker}.")
         return session_open_risk_usd, positions_this_cycle 
 
     print(f"[4/6] Scoring Expectancy on {len(structures)} candidate structures...")
     
     spot = chain.underlying.price
-    scored_plays = evaluate_and_rank(structures, regime, ticker, spot)
+    scored_plays = evaluate_and_rank(structures, regime, ticker, spot, intent)
     
     if not scored_plays:
         print("[-] No structures passed the strict R-Multiple and Risk limits.")
         return session_open_risk_usd, positions_this_cycle 
         
     top_play = scored_plays[0]
-    
-    print(f"      -> Top Play: {top_play.structure.strategy_type} | Score: {top_play.expectancy_score_usd:.2f}")
+    print(f"      -> Top Play: {top_play.structure.strategy_type} | Net EV(R): {top_play.net_ev_r:.2f}")
 
     print("[5/6] Checking Portfolio Risk Budget...")
     
@@ -107,19 +126,19 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     
     if not is_approved:
          print(f"[-] Trade rejected: {reject_reason}")
-         # REPLACED: Enqueue to background worker
          await enqueue_market_scan(ticker, regime, f"Risk Gate: {reject_reason}")
          return session_open_risk_usd, positions_this_cycle 
 
     print("[6/6] Synthesizing LLM Thesis and Queueing Webhook...")
     thesis = await asyncio.to_thread(generate_trade_thesis, ticker, regime, top_play)
       
-    # REPLACED: Enqueue to background worker for non-blocking dispatch
     await enqueue_alert(ticker, regime, top_play, thesis)
     
     print("[+] Alert queued for background delivery.")
     dispatched_alerts.add(trade_id) 
-    return session_open_risk_usd + top_play.structure.max_risk, positions_this_cycle + 1
+    
+    true_trade_risk_usd = top_play.structure.max_risk * top_play.exits.stop_loss_pct
+    return session_open_risk_usd + true_trade_risk_usd, positions_this_cycle + 1
 
 async def main():
     print("INITIALIZING MEGA-CAP OPTIONS AGENT...")

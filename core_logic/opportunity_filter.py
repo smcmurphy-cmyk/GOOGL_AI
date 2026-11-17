@@ -1,31 +1,21 @@
 from datetime import datetime, time
 import pytz
-from models.regime import RegimeState
 from models.market_data import OptionsChain
+from models.regime import RegimeState
 
 def is_viable_scalp_environment(chain: OptionsChain, regime: RegimeState) -> tuple[bool, str]:
-    """
-    Evaluates market context (Time of Day, Momentum, Liquidity) to determine 
-    if the regime presents a high-probability scalping opportunity.
-    """
-    # 1. Targeted Morning Trading Window (EST)
-    nyc_tz = pytz.timezone('America/New_York')
-    now = datetime.now(nyc_tz).time()
+    """Determines if the macro environment and time of day are viable for trading."""
+    eastern = pytz.timezone('US/Eastern')
+    now_et = datetime.now(eastern).time()
     
-    # Set strict 9:35 AM to 11:00 AM window
-    market_open = time(9, 35)
+    # PHASE 3 FIX: Open window at 9:30 ET to catch opening bell breakouts
+    market_open = time(9, 30)
     market_close = time(11, 0)
     
-    if not (market_open <= now <= market_close):
-        return False, "Outside morning scalp window (9:35 AM - 11:00 AM EST)."
-
-    # 2. Minimum Liquidity Check
-    total_volume = sum(c.volume for c in chain.contracts if c.volume is not None)
-    if total_volume < 1000:
-        return False, f"Insufficient chain volume ({total_volume} contracts)."
-
-    # 3. Regime Confirmation
-    if regime.regime_type == "UNCERTAIN" or not regime.is_tradeable:
-        return False, "Regime is UNCERTAIN or untradeable."
-
-    return True, "Passed Context Filter"
+    if not (market_open <= now_et <= market_close):
+        return False, f"TIME_WINDOW: Outside prime scalp window ({now_et.strftime('%H:%M:%S ET')})"
+        
+    if not regime.is_tradeable:
+        return False, "LIQUIDITY: Regime classified as un-tradeable (insufficient valid contracts)."
+        
+    return True, ""

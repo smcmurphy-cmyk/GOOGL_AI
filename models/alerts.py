@@ -1,18 +1,22 @@
-from pydantic import BaseModel, Field
-from typing import Optional
-from models.regime import RegimeState
+from pydantic import BaseModel
 from models.structures import OptionStructure
+from core_logic.strategy_selector import StrategyIntent
 
 class TradeExits(BaseModel):
-    profit_target_pct: float = Field(..., description="Target % of max credit/debit (e.g., 0.50 for 50%)")
-    stop_loss_pct: float = Field(..., description="Stop out % of max risk (e.g., 1.00 for 100%)")
-    time_stop_days: int = Field(..., description="0 = Intraday exit, 1 = Next day exit")
-    time_stop_minutes: int = 0
-    invalidation_level: Optional[float] = Field(None, description="Underlying price that invalidates the trade")
+    profit_target_pct: float
+    stop_loss_pct: float
+    time_stop_minutes: int
+    invalidation_level: float
+    invalidation_side: str 
 
 class ScoredPlay(BaseModel):
     ticker: str
-    regime: RegimeState
+    regime: str
+    intent: StrategyIntent
     structure: OptionStructure
-    expectancy_score: float = 0.0
-    exits: Optional[TradeExits] = None
+    expectancy_score_usd: float
+    net_ev_r: float
+    pop: float
+    pop_source: str
+    paper_only: bool
+    exits: TradeExits
