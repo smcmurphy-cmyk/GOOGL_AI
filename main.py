@@ -1,21 +1,42 @@
 import asyncio
+import datetime
+import pytz
 from config.settings import config
 
 # Import pipeline states
 from data_ingestion.schwab_fetcher import get_live_market_data as get_schwab_data, get_valid_access_token
-from data_ingestion.cboe_fetcher import get_market_data as get_cboe_data
 from core_logic.regime_classifier import classify_regime
 from core_logic.structure_builder import generate_structures
-from core_logic.expectancy_scorer import evaluate_and_rank
-from core_logic.portfolio_risk import portfolio_gatekeeper
+from core_logic.expectancy import evaluate_and_rank
+from core_logic.risk_gate import portfolio_gatekeeper
 from synthesis.agent_llm import generate_trade_thesis
-from dissemination.sheet_webhook import post_to_sheet, post_market_scan
 
-# Update import to reflect accurate naming
+# Asynchronous Outbox Imports
+from dissemination.outbox import enqueue_alert, enqueue_market_scan, outbox_worker
 from utils.volatility import get_historical_volatility_rank
 
-# Hardcoded for the test run. Later, move this to config/universe.py
-MEGA_CAP_TICKERS = ["TSLA", "QQQ", "SPY"]
+MEGA_CAP_TICKERS = ["TSLA", "QQQ", "SPY", "MSFT", "AAPL", "AMZN", "GOOGL", "NVDA", "META", "AMD"]
+
+async def wait_for_next_bar(buffer_seconds: int = 5):
+    """Sleeps precisely until `buffer_seconds` past the next 2-minute boundary."""
+    eastern = pytz.timezone('US/Eastern')
+    now = datetime.datetime.now(eastern)
+    
+    next_minute = now.minute + (2 - now.minute % 2)
+    
+    if next_minute >= 60:
+        next_minute -= 60
+        target_time = now.replace(minute=next_minute, second=buffer_seconds, microsecond=0) + datetime.timedelta(hours=1)
+    else:
+        target_time = now.replace(minute=next_minute, second=buffer_seconds, microsecond=0)
+        
+    sleep_duration = (target_time - now).total_seconds()
+    
+    if sleep_duration < 0:
+        sleep_duration += 120  
+        
+    print(f"[*] Awaiting bar close. Sleeping {sleep_duration:.1f}s until {target_time.strftime('%H:%M:%S ET')}")
+    await asyncio.sleep(sleep_duration)
 
 async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: str = None, positions_this_cycle: int = 0, dispatched_alerts: set = None):
     if dispatched_alerts is None:
@@ -24,7 +45,6 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     print(f"\n--- Starting Pipeline for {ticker} ---")
     print("[1/6] Ingesting Market Data...")
     
-# PHASE 3 FIX: Strictly enforce live broker data. CBOE delayed quotes are toxic for 0-DTE scalping.
     if not config.use_live_schwab_data:
         print("[-] FATAL: Live Schwab data disabled. Scalping requires real-time quotes. Skipping...")
         return session_open_risk_usd, positions_this_cycle
@@ -35,7 +55,6 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
         print(f"[-] No live chain data retrieved for {ticker}.")
         return session_open_risk_usd, positions_this_cycle
     
-    # PHASE 3 FIX: Offload synchronous yfinance network calls to a separate thread to prevent blocking
     historical_vol_rank = await asyncio.to_thread(get_historical_volatility_rank, ticker)
 
     print("[2/6] Classifying Macro Regime...")
@@ -43,31 +62,24 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
     regime = classify_regime(chain, historical_vol_rank)
     print(f"      -> {regime.regime_type} (GEX: ${regime.net_gex:,.0f})") 
     
-    # --- NEW PHASE 2: OPPORTUNITY FILTER ---
     from core_logic.opportunity_filter import is_viable_scalp_environment
     
     is_viable, reject_reason = is_viable_scalp_environment(chain, regime)
     
     if not is_viable:
        print(f"[-] Opportunity Rejected: {reject_reason}") 
-        
-        # ACTIVATE MARKET SCAN LOGGING
-       await post_market_scan(ticker, regime, reject_reason)
-        
+       # REPLACED: Enqueue to background worker instead of blocking
+       await enqueue_market_scan(ticker, regime, reject_reason)
        return session_open_risk_usd, positions_this_cycle
     
-    # STATE 3: STRUCTURE GENERATION
     print("[3/6] Generating Defined-Risk Structures...")
     structures = generate_structures(chain, regime)
     if not structures:
         print(f"[-] No valid structures found for {ticker} in current regime.")
         return session_open_risk_usd, positions_this_cycle 
 
-    # STATE 4: EXPECTANCY SCORING
     print(f"[4/6] Scoring Expectancy on {len(structures)} candidate structures...")
     
-    # Passed ticker back into the scorer
-    # P0 FIX: Pass spot into evaluate_and_rank
     spot = chain.underlying.price
     scored_plays = evaluate_and_rank(structures, regime, ticker, spot)
     
@@ -77,10 +89,8 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
         
     top_play = scored_plays[0]
     
-    # FIX: Mapped attribute to the new expectancy_score field
-    print(f"      -> Top Play: {top_play.structure.strategy_type} | Score: {top_play.expectancy_score:.2f}")
+    print(f"      -> Top Play: {top_play.structure.strategy_type} | Score: {top_play.expectancy_score_usd:.2f}")
 
-    # STATE 5: PORTFOLIO GATEKEEPER
     print("[5/6] Checking Portfolio Risk Budget...")
     
     trade_id = f"{ticker}-{top_play.structure.strategy_type}"
@@ -88,65 +98,73 @@ async def run_pipeline(ticker: str, session_open_risk_usd: float, access_token: 
         print(f"[-] Alert suppressed: {trade_id} already dispatched today.")
         return session_open_risk_usd, positions_this_cycle
 
-    # Passed positions_this_cycle into run_pipeline() as a parameter to feed this gatekeeper.
     is_approved, reject_reason = portfolio_gatekeeper(
         top_play, 
         session_open_risk_usd, 
-        historical_vol_rank, 
         positions_this_cycle=positions_this_cycle, 
         account_balance=10000.0
     )
     
     if not is_approved:
          print(f"[-] Trade rejected: {reject_reason}")
-         # Log portfolio rejections to Market Scans so you know you had an edge but lacked capital
-         await post_market_scan(ticker, regime, f"Risk Gate: {reject_reason}")
+         # REPLACED: Enqueue to background worker
+         await enqueue_market_scan(ticker, regime, f"Risk Gate: {reject_reason}")
          return session_open_risk_usd, positions_this_cycle 
 
-    # STATE 6: SYNTHESIS & DISSEMINATION
-    print("[6/6] Synthesizing LLM Thesis and Dispatching Webhook...")
-    # P1 FIX: Offload synchronous LLM generation to a separate thread to prevent blocking the async pipeline
+    print("[6/6] Synthesizing LLM Thesis and Queueing Webhook...")
     thesis = await asyncio.to_thread(generate_trade_thesis, ticker, regime, top_play)
       
-    # POST to webhook (Ensure your .env has WEBHOOK_URL defined)
-    success = await post_to_sheet(ticker, regime, top_play, thesis)
+    # REPLACED: Enqueue to background worker for non-blocking dispatch
+    await enqueue_alert(ticker, regime, top_play, thesis)
     
-    if success:
-        print("[+] Alert successfully dispatched!")
-        dispatched_alerts.add(trade_id) # Lock out this setup until reset
-        return session_open_risk_usd + top_play.structure.max_risk, positions_this_cycle + 1
-    else:
-        print("[-] Failed to dispatch webhook.")
-        return session_open_risk_usd, positions_this_cycle 
+    print("[+] Alert queued for background delivery.")
+    dispatched_alerts.add(trade_id) 
+    return session_open_risk_usd + top_play.structure.max_risk, positions_this_cycle + 1
 
 async def main():
     print("INITIALIZING MEGA-CAP OPTIONS AGENT...")
-    # P0 FIX: Initialize state OUTSIDE the infinite loop so it persists across cycles
     session_open_risk_usd = 0.0 
-    
-    # P1 FIX: Track dispatched trades by ticker+strategy to prevent spamming the same setup
     dispatched_alerts = set()
+    eastern = pytz.timezone('US/Eastern')
 
     while True:
-        # 1. Check if we are inside the morning rush window
-        from datetime import datetime, time
-        import pytz
+        now_et = datetime.datetime.now(eastern)
         
-        nyc_tz = pytz.timezone('America/New_York')
-        now = datetime.now(nyc_tz).time()
+        market_open = datetime.time(9, 32)
+        market_close = datetime.time(16, 0)
         
-        # Match the target window: 9:35 to 11:00 EST (6:35 to 8:00 PST)
-        market_open = time(9, 35)
-        market_close = time(11, 0)
+        # 1. Deep Hibernation: Check if it's the weekend or outside market hours
+        is_weekend = now_et.weekday() >= 5
+        is_outside_hours = not (market_open <= now_et.time() < market_close)
         
-        if not (market_open <= now <= market_close):
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Outside morning scalp window. Sleeping for 60 seconds...")
-            await asyncio.sleep(60)
+        if is_weekend or is_outside_hours:
+            # Calculate exactly when 09:32 ET occurs next
+            next_open = now_et.replace(hour=9, minute=32, second=0, microsecond=0)
+            
+            # If it's already past 09:32 today, push to tomorrow
+            if now_et >= next_open:
+                next_open += datetime.timedelta(days=1)
+                
+            # Keep pushing forward if the next open lands on a Saturday (5) or Sunday (6)
+            while next_open.weekday() >= 5:
+                next_open += datetime.timedelta(days=1)
+                
+            sleep_seconds = (next_open - now_et).total_seconds()
+            
+            # Format the output for the console so you know exactly when it will wake up
+            hours, remainder = divmod(sleep_seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            
+            print(f"[{now_et.strftime('%H:%M:%S ET')}] Market closed. Hibernating for {int(hours)}h {int(minutes)}m until {next_open.strftime('%A %m/%d at %H:%M ET')}...")
+            
+            await asyncio.sleep(sleep_seconds)
             continue
             
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] WAKING AGENT FOR 2-MINUTE SCAN CYCLE...")
+        # 2. If we ARE in market hours, sync perfectly to the next 2-minute bar close
+        await wait_for_next_bar(buffer_seconds=5)
+        
+        print(f"\n[{datetime.datetime.now(eastern).strftime('%H:%M:%S ET')}] WAKING AGENT FOR 2-MINUTE SCAN CYCLE...")
 
-        # 2. Fetch/Refresh the Access Token
         session_access_token = None
         if config.use_live_schwab_data:
             print("[+] Authenticating with Schwab API...")
@@ -155,15 +173,11 @@ async def main():
                 print("[+] Live Token Acquired.")
             except Exception as e:
                 print(f"[-] Token acquisition failed: {e}. Retrying next cycle.")
-                await asyncio.sleep(60)
                 continue
 
-        # 3. Track accumulated risk across the session
-        
         positions_this_cycle = 0
         
         for ticker in MEGA_CAP_TICKERS:
-            # PHASE 1 FIX: Top-level exception handling prevents isolated data errors from crashing the agent
             try:
                 session_open_risk_usd, positions_this_cycle = await run_pipeline(
                     ticker, 
@@ -174,20 +188,21 @@ async def main():
                 ) 
             except Exception as e:
                 print(f"[-] CRITICAL PIPELINE ERROR for {ticker}: {type(e).__name__} - {e}")
-                # Failsafe: Continue to the next ticker so the bot stays alive
                 continue
                 
-            await asyncio.sleep(2) # Stagger requests to respect API rate limits
+            await asyncio.sleep(2) 
             
         print("\nSCAN CYCLE COMPLETE.") 
         print(f"Total Projected Risk Allocated This Cycle: ${session_open_risk_usd:,.2f}")
-        
-        # 4. Sleep for exactly 2 minutes before the next scan
-        print("Agent resting for 2 minutes...")
-        await asyncio.sleep(120) 
+
+async def application_runner():
+    # FINAL STEP C FIX: Start the outbox worker concurrently with the main loop
+    worker_task = asyncio.create_task(outbox_worker())
+    
+    await main()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(application_runner())
     except KeyboardInterrupt:
         print("\nAgent gracefully shut down by user.")
